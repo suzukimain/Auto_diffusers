@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 from diffusers import FlaxDiffusionPipeline
 
-from ..setup.Base_config import Basic_config
+from ..setup.base_config import Basic_config
 
 
 class With_Flax(Basic_config):

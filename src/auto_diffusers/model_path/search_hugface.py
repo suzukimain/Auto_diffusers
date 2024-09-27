@@ -10,7 +10,7 @@ from diffusers import (DiffusionPipeline,
 
 from huggingface_hub import hf_hub_download
 
-from ..setup.Base_config import Basic_config
+from ..setup.base_config import Basic_config
 
 
 class Huggingface(Basic_config):
@@ -275,8 +275,6 @@ class Huggingface(Basic_config):
         file_value=self.list_safe_check(file_value)
         if len(file_value)>=self.num_prints: #15
             start_number="1"
-            #previous_select = self.check_func_hist(key=check_key)
-            #if previous_select:
             choice_history = self.check_func_hist(key = check_key,return_value=True)
             if choice_history:
                 if choice_history>self.num_prints+1:
@@ -352,7 +350,6 @@ class Huggingface(Basic_config):
                     return choice_path
                 else:
                     print(f"\033[33mPlease enter numbers from 1~{len(file_value)}\033[34m")
-        #print("\033[0m",end="")
 
 
     def file_name_set(

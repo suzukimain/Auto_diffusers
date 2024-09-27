@@ -185,7 +185,10 @@ class pipeline_setup(Config_Mix):
 
 
     def pipe_status_check(self,pipeline):
-        from diffusers.pipelines.stable_diffusion import (StableDiffusionSafetyChecker,FlaxStableDiffusionSafetyChecker)
+        from diffusers.pipelines.stable_diffusion import (
+            StableDiffusionSafetyChecker,
+            FlaxStableDiffusionSafetyChecker
+            )
         from transformers import CLIPImageProcessor
         pipe_class_name_ = pipeline.__class__.__name__
         pipe_type = self.pipeline_metod_type(self.import_on_str(pipe_class_name_,"diffusers"))
