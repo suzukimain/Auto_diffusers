@@ -26,7 +26,7 @@ for minor_version in range(8, version_range_max):
 
 setup(
     name="auto_diffusers",
-    version="2.0.37",
+    version="2.0.38",
     description="diffusers with search engine",
     long_description=Path("README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
