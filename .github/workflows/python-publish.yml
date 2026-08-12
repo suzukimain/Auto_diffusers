@@ -23,11 +23,13 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   update-version:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
     - name: Checkout Repo
       uses: actions/checkout@v4

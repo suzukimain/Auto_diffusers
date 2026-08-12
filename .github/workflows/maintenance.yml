@@ -6,114 +6,133 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 22 * * *'
+    - cron: "0 22 * * *"
   workflow_dispatch:
 
 jobs:
   operation-check:
     runs-on: ubuntu-22.04
     outputs:
-      check_failed: ${{ env.CHECK_FAILED }}
-
+      check_failed: ${{ steps.final.outputs.check_failed }}
+      hf_ok: ${{ steps.final.outputs.hf_ok }}
+      civitai_ok: ${{ steps.final.outputs.civitai_ok }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -U torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e .
 
-      - name: Init result flags
-        run: |
-          echo "HF_OK=true" >> "$GITHUB_ENV"
-          echo "CIVITAI_OK=true" >> "$GITHUB_ENV"
-
       - name: Test import
-        run: |
-          set +e
-          python -c "import auto_diffusers" 2>&1 | tee import.log
-          echo "IMPORT_RC=$?" >> "$GITHUB_ENV"
+        run: python -c "import auto_diffusers"
 
-      - name: Test from_huggingface
+      - name: Test Hugging Face search without downloading weights
+        id: huggingface
+        continue-on-error: true
         run: |
-          set +e
-          python - <<'EOF' 2>&1 | tee hf.log
-          from auto_diffusers import EasyPipelineForText2Image
-          EasyPipelineForText2Image.from_huggingface("Stable Diffusion")
-          EOF
-          RC=$?
-          if [ $RC -ne 0 ]; then
-            echo "HF_OK=false" >> "$GITHUB_ENV"
-          fi
+          python - <<'PY' >hf.log 2>&1
+          from auto_diffusers import search_huggingface
 
-      - name: Test from_civitai
+          result = search_huggingface(
+              "stabilityai/stable-diffusion-xl-base-1.0",
+              include_params=True,
+          )
+          assert result.model_path
+          assert result.repo_status.repo_id
+          print(result.model_status.site_url)
+          PY
+
+      - name: Test Civitai API contracts without downloading weights
+        id: civitai
+        continue-on-error: true
         run: |
-          set +e
-          python - <<'EOF' 2>&1 | tee civitai.log
-          from auto_diffusers import EasyPipelineForText2Image
-          EasyPipelineForText2Image.from_civitai("Anything", base_model="SD 1.5")
-          EOF
-          RC=$?
-          if [ $RC -ne 0 ]; then
-            echo "CIVITAI_OK=false" >> "$GITHUB_ENV"
-          fi
+          python - <<'PY' >civitai.log 2>&1
+          import requests
+          first_page = requests.get(
+              "https://civitai.com/api/v1/models",
+              params={"query": "Stable Diffusion", "limit": 1},
+              timeout=30,
+          )
+          first_page.raise_for_status()
+          first_items = first_page.json()["items"]
+          assert len(first_items) == 1
+
+          model_id = first_items[0]["id"]
+          by_id = requests.get(
+              "https://civitai.com/api/v1/models",
+              params={"ids": model_id, "limit": 1},
+              timeout=30,
+          )
+          by_id.raise_for_status()
+          assert by_id.json()["items"][0]["id"] == model_id
+
+          limited = requests.get(
+              "https://civitai.com/api/v1/models",
+              params={"query": "Stable Diffusion", "limit": 2},
+              timeout=30,
+          )
+          limited.raise_for_status()
+          assert len(limited.json()["items"]) == 2
+          print(f"Checked Civitai model ID {model_id}")
+          PY
 
       - name: Collect logs
+        if: always()
         run: |
           {
-            echo "HF_OK=${HF_OK}"
-            echo "CIVITAI_OK=${CIVITAI_OK}"
-            echo
-            echo "===== import.log ====="
-            cat import.log || true
-            echo
             echo "===== hf.log ====="
-            cat hf.log || true
+            cat hf.log 2>/dev/null || true
             echo
             echo "===== civitai.log ====="
-            cat civitai.log || true
+            cat civitai.log 2>/dev/null || true
           } > failure.log
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: operation-check-log
           path: failure.log
 
       - name: Final judge
+        id: final
+        if: always()
         run: |
-          if [ "${HF_OK}" = "false" ] || [ "${CIVITAI_OK}" = "false" ]; then
-            echo "CHECK_FAILED=true" >> "$GITHUB_ENV"
+          HF_OK=${{ steps.huggingface.outcome == 'success' }}
+          CIVITAI_OK=${{ steps.civitai.outcome == 'success' }}
+          echo "hf_ok=$HF_OK" >> "$GITHUB_OUTPUT"
+          echo "civitai_ok=$CIVITAI_OK" >> "$GITHUB_OUTPUT"
+          if [ "$HF_OK" = "true" ] && [ "$CIVITAI_OK" = "true" ]; then
+            echo "check_failed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "CHECK_FAILED=false" >> "$GITHUB_ENV"
+            echo "check_failed=true" >> "$GITHUB_OUTPUT"
           fi
 
   create-issue:
     needs: operation-check
     runs-on: ubuntu-22.04
     if: needs.operation-check.outputs.check_failed == 'true'
-
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: operation-check-log
-
       - name: Create or update issue
         env:
           GH_TOKEN: ${{ github.token }}
+          HF_OK: ${{ needs.operation-check.outputs.hf_ok }}
+          CIVITAI_OK: ${{ needs.operation-check.outputs.civitai_ok }}
         run: |
           FAIL_HASH=$(sha256sum failure.log | cut -d' ' -f1)
           TITLE="Operation Check failed [hash:${FAIL_HASH}]"
-
           BODY=$(cat <<EOF
           Operation Check failed.
 
-          **HF_OK:** ${HF_OK}  
-          **CIVITAI_OK:** ${CIVITAI_OK}  
+          **HF_OK:** ${HF_OK}
+          **CIVITAI_OK:** ${CIVITAI_OK}
 
           <details>
           <summary>Logs</summary>
@@ -124,17 +143,9 @@ jobs:
           </details>
           EOF
           )
-
-          EXISTING=$(gh issue list \
-            --state open \
-            --search "hash:${FAIL_HASH}" \
-            --json number \
-            -q '.[0].number')
-
+          EXISTING=$(gh issue list --state open --search "hash:${FAIL_HASH}" --json number -q '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --body "$BODY"
           else
-            gh issue create \
-              --title "$TITLE" \
-              --body "$BODY"
+            gh issue create --title "$TITLE" --body "$BODY"
           fi
