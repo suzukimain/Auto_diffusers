@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2026 suzukimain
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 # Standard library imports
 import os
 import re
-import types
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Union
+from types import MethodType
+from typing import Optional, Union
+from urllib.parse import urlparse
 
 # Third-party imports
 import requests
 import torch
+from diffusers import (
+    StableDiffusionInpaintPipeline,
+    StableDiffusionUpscalePipeline,
+    StableDiffusionXLInpaintPipeline,
+)
+from diffusers import __version__ as diffusers_version
 
 # Diffusers core imports
 from diffusers.loaders.single_file_utils import (
@@ -42,45 +50,21 @@ from diffusers.pipelines.auto_pipeline import (
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import logging
-
-# Stable Diffusion v1/v2 pipelines
-from diffusers import (
-    StableDiffusionImg2ImgPipeline,
-    StableDiffusionInpaintPipeline,
-    StableDiffusionPipeline,
-    StableDiffusionUpscalePipeline,
-)
-
-# Stable Diffusion XL pipelines
-from diffusers import (
-    StableDiffusionXLControlNetImg2ImgPipeline,
-    StableDiffusionXLControlNetInpaintPipeline,
-    StableDiffusionXLControlNetPipeline,
-    StableDiffusionXLImg2ImgPipeline,
-    StableDiffusionXLInpaintPipeline,
-    StableDiffusionXLPipeline,
-)
-
-# Stable Diffusion 3 pipelines
-from diffusers import (
-    StableDiffusion3Img2ImgPipeline,
-    StableDiffusion3InpaintPipeline,
-    StableDiffusion3Pipeline,
-)
+from packaging.version import Version
 
 # Flux pipelines (import separately to avoid Flax deprecation warnings)
 try:
     from diffusers.pipelines.flux import (
-        FluxImg2ImgPipeline,
-        FluxInpaintPipeline,
-        FluxPipeline,
         FluxControlImg2ImgPipeline,
         FluxControlInpaintPipeline,
         FluxControlNetImg2ImgPipeline,
         FluxControlNetInpaintPipeline,
         FluxControlNetPipeline,
         FluxControlPipeline,
+        FluxImg2ImgPipeline,
+        FluxInpaintPipeline,
         FluxKontextPipeline,
+        FluxPipeline,
     )
 except ImportError:
     FluxImg2ImgPipeline = None
@@ -93,13 +77,6 @@ except ImportError:
     FluxControlNetPipeline = None
     FluxControlPipeline = None
     FluxKontextPipeline = None
-
-# ControlNet pipelines
-from diffusers import (
-    StableDiffusionControlNetImg2ImgPipeline,
-    StableDiffusionControlNetInpaintPipeline,
-    StableDiffusionControlNetPipeline,
-)
 
 # AnimateDiff pipelines
 from diffusers import (
@@ -116,14 +93,14 @@ try:
         CogView4ControlPipeline,
         CogView4Pipeline,
         HunyuanDiTPipeline,
+        Kandinsky3Img2ImgPipeline,
+        Kandinsky3Pipeline,
         KandinskyCombinedPipeline,
         KandinskyImg2ImgCombinedPipeline,
         KandinskyInpaintCombinedPipeline,
         KandinskyV22CombinedPipeline,
         KandinskyV22Img2ImgCombinedPipeline,
         KandinskyV22InpaintCombinedPipeline,
-        Kandinsky3Img2ImgPipeline,
-        Kandinsky3Pipeline,
         LatentConsistencyModelImg2ImgPipeline,
         LatentConsistencyModelPipeline,
         Lumina2Pipeline,
@@ -204,273 +181,167 @@ from huggingface_hub import hf_api, hf_hub_download, hf_hub_url
 from huggingface_hub.file_download import http_get
 from huggingface_hub.utils import validate_hf_hub_args
 
-
 logger = logging.get_logger(__name__)
 
-# Suppress verbose warnings from dependencies
-logging.set_verbosity_error()
-# Reduce logging level for torchao
-try:
-    import logging as std_logging
-    std_logging.getLogger("torchao").setLevel(std_logging.WARNING)
-    std_logging.getLogger("torchao.kernel.intmm").setLevel(std_logging.ERROR)
-except Exception:
-    pass
 
-
-SINGLE_FILE_CHECKPOINT_TEXT2IMAGE_PIPELINE_MAPPING = OrderedDict(
+SINGLE_FILE_MODEL_TYPE_TO_AUTO_PIPELINE_KEY = OrderedDict(
     [
-        ("animatediff_rgb", AnimateDiffPipeline),
-        ("animatediff_scribble", AnimateDiffPipeline),
-        ("animatediff_sdxl_beta", AnimateDiffSDXLPipeline),
-        ("animatediff_v1", AnimateDiffPipeline),
-        ("animatediff_v2", AnimateDiffPipeline),
-        ("animatediff_v3", AnimateDiffPipeline),
-        ("auraflow", AuraFlowPipeline),
-        ("autoencoder-dc-f128c512", None),
-        ("autoencoder-dc-f32c32", None),
-        ("autoencoder-dc-f32c32-sana", None),
-        ("autoencoder-dc-f64c128", None),
-        ("chroma", ChromaPipeline),
-        ("cogview3", CogView3PlusPipeline),
-        ("cogview4", CogView4Pipeline),
-        ("cogview4-control", CogView4ControlPipeline),
-        ("controlnet", StableDiffusionControlNetPipeline),
-        ("controlnet_xl", StableDiffusionXLControlNetPipeline),
-        ("controlnet_xl_large", StableDiffusionXLControlNetPipeline),
-        ("controlnet_xl_mid", StableDiffusionXLControlNetPipeline),
-        ("controlnet_xl_small", StableDiffusionXLControlNetPipeline),
-        ("controlnet_xl_union", StableDiffusionXLControlNetUnionPipeline),
-        ("cosmos-1.0-t2w-7B", None),
-        ("cosmos-1.0-t2w-14B", None),
-        ("cosmos-1.0-v2w-7B", None),
-        ("cosmos-1.0-v2w-14B", None),
-        ("cosmos-2.0-t2i-2B", None),
-        ("cosmos-2.0-t2i-14B", None),
-        ("cosmos-2.0-v2w-2B", None),
-        ("cosmos-2.0-v2w-14B", None),
-        ("flux-2-dev", FluxPipeline),
-        ("flux-control", FluxControlPipeline),
-        ("flux-controlnet", FluxControlNetPipeline),
-        ("flux-depth", FluxPipeline),
-        ("flux-dev", FluxPipeline),
-        ("flux-fill", FluxPipeline),
-        ("flux-kontext", FluxKontextPipeline),
-        ("flux-schnell", FluxPipeline),
-        ("hidream", None),
-        ("hunyuan", HunyuanDiTPipeline),
-        ("hunyuan-video", None),
-        ("inpainting", None),
-        ("inpainting_v2", None),
-        ("instruct-pix2pix", None),
-        ("kandinsky", KandinskyCombinedPipeline),
-        ("kandinsky22", KandinskyV22CombinedPipeline),
-        ("kandinsky3", Kandinsky3Pipeline),
-        ("lcm", LatentConsistencyModelPipeline),
-        ("lumina", LuminaPipeline),
-        ("lumina2", Lumina2Pipeline),
-        ("ltx-video", None),
-        ("ltx-video-0.9.1", None),
-        ("ltx-video-0.9.5", None),
-        ("ltx-video-0.9.7", None),
-        ("mochi-1-preview", None),
-        ("ovis", OvisImagePipeline),
-        ("pixart-alpha", PixArtAlphaPipeline),
-        ("pixart-sigma", PixArtSigmaPipeline),
-        ("playground-v2-5", StableDiffusionXLPipeline),
-        ("qwenimage", QwenImagePipeline),
-        ("qwenimage-controlnet", QwenImageControlNetPipeline),
-        ("sana", SanaPipeline),
-        ("sd3", StableDiffusion3Pipeline),
-        ("sd35_large", StableDiffusion3Pipeline),
-        ("sd35_medium", StableDiffusion3Pipeline),
-        ("sd3-controlnet", StableDiffusion3ControlNetPipeline),
-        ("stable_cascade_stage_b", None),
-        ("stable_cascade_stage_b_lite", None),
-        ("stable_cascade_stage_c", None),
-        ("stable_cascade_stage_c_lite", None),
-        ("upscale", StableDiffusionUpscalePipeline),
-        ("v1", StableDiffusionPipeline),
-        ("v2", StableDiffusionPipeline),
-        ("wan-i2v-14B", WanImageToVideoPipeline),
-        ("wan-t2v-1.3B", WanPipeline),
-        ("wan-t2v-14B", WanPipeline),
-        ("wan-vace-1.3B", WanVideoToVideoPipeline),
-        ("wan-vace-14B", WanVideoToVideoPipeline),
-        ("xl_base", StableDiffusionXLPipeline),
-        ("xl_refiner", StableDiffusionXLPipeline),
-        ("z-image", ZImagePipeline),
-        ("z-image-controlnet", ZImageControlNetPipeline),
-        ("z-image-omni", ZImageOmniPipeline),
-        ("z-image-turbo", None),
-        ("z-image-turbo-controlnet", None),
-        ("z-image-turbo-controlnet-2.0", None),
-        ("z-image-turbo-controlnet-2.1", None),
-    ],
-)
-
-# For single-file checkpoints we expose separate mappings for each task so callers
-# can pick the most appropriate pipeline class set. The full, explicit mappings
-# for image2image and inpaint are defined below; keep distinct names so they can
-# be customized independently.
-
-SINGLE_FILE_CHECKPOINT_IMAGE2IMAGE_PIPELINE_MAPPING = OrderedDict(
-    [
-        ("animatediff_rgb", AnimateDiffPipeline),
-        ("animatediff_scribble", AnimateDiffPipeline),
-        ("animatediff_sdxl_beta", AnimateDiffSDXLPipeline),
-        ("animatediff_v1", AnimateDiffPipeline),
-        ("animatediff_v2", AnimateDiffPipeline),
-        ("animatediff_v3", AnimateDiffPipeline),
-        ("autoencoder-dc-f128c512", None),
-        ("autoencoder-dc-f32c32", None),
-        ("autoencoder-dc-f32c32-sana", None),
-        ("autoencoder-dc-f64c128", None),
-        ("controlnet", StableDiffusionControlNetImg2ImgPipeline),
-        ("controlnet_xl", StableDiffusionXLControlNetImg2ImgPipeline),
-        ("controlnet_xl_large", StableDiffusionXLControlNetImg2ImgPipeline),
-        ("controlnet_xl_mid", StableDiffusionXLControlNetImg2ImgPipeline),
-        ("controlnet_xl_small", StableDiffusionXLControlNetImg2ImgPipeline),
-        ("controlnet_xl_union", StableDiffusionXLControlNetUnionImg2ImgPipeline),
-        ("cosmos-1.0-t2w-7B", None),
-        ("cosmos-1.0-t2w-14B", None),
-        ("cosmos-1.0-v2w-7B", None),
-        ("cosmos-1.0-v2w-14B", None),
-        ("cosmos-2.0-t2i-2B", None),
-        ("cosmos-2.0-t2i-14B", None),
-        ("cosmos-2.0-v2w-2B", None),
-        ("cosmos-2.0-v2w-14B", None),
-        ("flux-2-dev", FluxImg2ImgPipeline),
-        ("flux-control", FluxControlImg2ImgPipeline),
-        ("flux-controlnet", FluxControlNetImg2ImgPipeline),
-        ("flux-depth", FluxImg2ImgPipeline),
-        ("flux-dev", FluxImg2ImgPipeline),
-        ("flux-fill", FluxImg2ImgPipeline),
-        ("flux-kontext", FluxKontextPipeline),
-        ("flux-schnell", FluxImg2ImgPipeline),
-        ("hidream", None),
-        ("hunyuan-video", None),
-        ("inpainting", None),
-        ("inpainting_v2", None),
-        ("instruct-pix2pix", None),
-        ("kandinsky", KandinskyImg2ImgCombinedPipeline),
-        ("kandinsky22", KandinskyV22Img2ImgCombinedPipeline),
-        ("kandinsky3", Kandinsky3Img2ImgPipeline),
-        ("lcm", LatentConsistencyModelImg2ImgPipeline),
-        ("lumina", None),
-        ("lumina2", None),
-        ("ltx-video", None),
-        ("ltx-video-0.9.1", None),
-        ("ltx-video-0.9.5", None),
-        ("ltx-video-0.9.7", None),
-        ("mochi-1-preview", None),
-        ("playground-v2-5", StableDiffusionXLImg2ImgPipeline),
-        ("qwenimage", QwenImageImg2ImgPipeline),
-        ("qwenimage-edit", QwenImageEditPipeline),
-        ("qwenimage-edit-plus", QwenImageEditPlusPipeline),
-        ("qwenimage-layered", QwenImageLayeredPipeline),
-        ("sana", None),
-        ("sd3", StableDiffusion3Img2ImgPipeline),
-        ("sd35_large", StableDiffusion3Img2ImgPipeline),
-        ("sd35_medium", StableDiffusion3Img2ImgPipeline),
-        ("stable_cascade_stage_b", None),
-        ("stable_cascade_stage_b_lite", None),
-        ("stable_cascade_stage_c", None),
-        ("stable_cascade_stage_c_lite", None),
-        ("upscale", StableDiffusionUpscalePipeline),
-        ("v1", StableDiffusionImg2ImgPipeline),
-        ("v2", StableDiffusionImg2ImgPipeline),
-        ("wan-i2v-14B", WanImageToVideoPipeline),
-        ("wan-t2v-1.3B", None),
-        ("wan-t2v-14B", None),
-        ("wan-vace-1.3B", WanVideoToVideoPipeline),
-        ("wan-vace-14B", WanVideoToVideoPipeline),
-        ("xl_base", StableDiffusionXLImg2ImgPipeline),
-        ("xl_refiner", StableDiffusionXLImg2ImgPipeline),
-        ("z-image", ZImageImg2ImgPipeline),
-        ("z-image-turbo", None),
-        ("z-image-turbo-controlnet", None),
-        ("z-image-turbo-controlnet-2.0", None),
-        ("z-image-turbo-controlnet-2.1", None),
+        ("auraflow", "auraflow"),
+        ("chroma", "chroma"),
+        ("cogview3", "cogview3"),
+        ("cogview4", "cogview4"),
+        ("cogview4-control", "cogview4-control"),
+        ("controlnet", "stable-diffusion-controlnet"),
+        ("controlnet_xl", "stable-diffusion-xl-controlnet"),
+        ("controlnet_xl_large", "stable-diffusion-xl-controlnet"),
+        ("controlnet_xl_mid", "stable-diffusion-xl-controlnet"),
+        ("controlnet_xl_small", "stable-diffusion-xl-controlnet"),
+        ("controlnet_xl_union", "stable-diffusion-xl-controlnet-union"),
+        ("flux-control", "flux-control"),
+        ("flux-controlnet", "flux-controlnet"),
+        ("flux-depth", "flux"),
+        ("flux-dev", "flux"),
+        ("flux-fill", "flux"),
+        ("flux-kontext", "flux-kontext"),
+        ("flux-schnell", "flux"),
+        ("hunyuan", "hunyuan"),
+        ("kandinsky", "kandinsky"),
+        ("kandinsky22", "kandinsky22"),
+        ("kandinsky3", "kandinsky3"),
+        ("lcm", "lcm"),
+        ("lumina", "lumina"),
+        ("lumina2", "lumina2"),
+        ("pixart-alpha", "pixart-alpha"),
+        ("pixart-sigma", "pixart-sigma"),
+        ("playground-v2-5", "stable-diffusion-xl"),
+        ("qwenimage", "qwenimage"),
+        ("qwenimage-controlnet", "qwenimage-controlnet"),
+        ("qwenimage-edit", "qwenimage-edit"),
+        ("qwenimage-edit-plus", "qwenimage-edit-plus"),
+        ("sana", "sana"),
+        ("sd3", "stable-diffusion-3"),
+        ("sd35_large", "stable-diffusion-3"),
+        ("sd35_medium", "stable-diffusion-3"),
+        ("sd3-controlnet", "stable-diffusion-3-controlnet"),
+        ("v1", "stable-diffusion"),
+        ("v2", "stable-diffusion"),
+        ("xl_base", "stable-diffusion-xl"),
+        ("xl_refiner", "stable-diffusion-xl"),
+        ("z-image", "z-image"),
+        ("z-image-controlnet", "z-image-controlnet"),
     ]
 )
 
-SINGLE_FILE_CHECKPOINT_INPAINT_PIPELINE_MAPPING = OrderedDict(
-    [
-        ("animatediff_rgb", None),
-        ("animatediff_scribble", None),
-        ("animatediff_sdxl_beta", None),
-        ("animatediff_v1", None),
-        ("animatediff_v2", None),
-        ("animatediff_v3", None),
-        ("autoencoder-dc-f128c512", None),
-        ("autoencoder-dc-f32c32", None),
-        ("autoencoder-dc-f32c32-sana", None),
-        ("autoencoder-dc-f64c128", None),
-        ("controlnet", StableDiffusionControlNetInpaintPipeline),
-        ("controlnet_xl", StableDiffusionXLControlNetInpaintPipeline),
-        ("controlnet_xl_large", StableDiffusionXLControlNetInpaintPipeline),
-        ("controlnet_xl_mid", StableDiffusionXLControlNetInpaintPipeline),
-        ("controlnet_xl_small", StableDiffusionXLControlNetInpaintPipeline),
-        ("controlnet_xl_union", StableDiffusionXLControlNetUnionInpaintPipeline),
-        ("cosmos-1.0-t2w-7B", None),
-        ("cosmos-1.0-t2w-14B", None),
-        ("cosmos-1.0-v2w-7B", None),
-        ("cosmos-1.0-v2w-14B", None),
-        ("cosmos-2.0-t2i-2B", None),
-        ("cosmos-2.0-t2i-14B", None),
-        ("cosmos-2.0-v2w-2B", None),
-        ("cosmos-2.0-v2w-14B", None),
-        ("flux-2-dev", FluxInpaintPipeline),
-        ("flux-control", FluxControlInpaintPipeline),
-        ("flux-controlnet", FluxControlNetInpaintPipeline),
-        ("flux-depth", FluxInpaintPipeline),
-        ("flux-dev", FluxInpaintPipeline),
-        ("flux-fill", FluxInpaintPipeline),
-        ("flux-schnell", FluxInpaintPipeline),
-        ("hidream", None),
-        ("hunyuan-video", None),
-        ("inpainting", StableDiffusionInpaintPipeline),
-        ("inpainting_v2", StableDiffusionInpaintPipeline),
-        ("instruct-pix2pix", None),
-        ("kandinsky", KandinskyInpaintCombinedPipeline),
-        ("kandinsky22", KandinskyV22InpaintCombinedPipeline),
-        ("lcm", None),
-        ("lumina", None),
-        ("lumina2", None),
-        ("ltx-video", None),
-        ("ltx-video-0.9.1", None),
-        ("ltx-video-0.9.5", None),
-        ("ltx-video-0.9.7", None),
-        ("mochi-1-preview", None),
-        ("playground-v2-5", None),
-        ("qwenimage", QwenImageInpaintPipeline),
-        ("qwenimage-edit", QwenImageEditInpaintPipeline),
-        ("sana", None),
-        ("sd3", StableDiffusion3InpaintPipeline),
-        ("sd35_large", StableDiffusion3InpaintPipeline),
-        ("sd35_medium", StableDiffusion3InpaintPipeline),
-        ("sd3-controlnet", StableDiffusion3ControlNetInpaintingPipeline),
-        ("stable_cascade_stage_b", None),
-        ("stable_cascade_stage_b_lite", None),
-        ("stable_cascade_stage_c", None),
-        ("stable_cascade_stage_c_lite", None),
-        ("upscale", StableDiffusionUpscalePipeline),
-        ("v1", StableDiffusionInpaintPipeline),
-        ("v2", StableDiffusionInpaintPipeline),
-        ("wan-i2v-14B", None),
-        ("wan-t2v-1.3B", None),
-        ("wan-t2v-14B", None),
-        ("wan-vace-1.3B", None),
-        ("wan-vace-14B", None),
-        ("xl_base", StableDiffusionXLInpaintPipeline),
-        ("xl_inpaint", StableDiffusionXLInpaintPipeline),
-        ("z-image-controlnet-inpaint", ZImageControlNetInpaintPipeline),
-        ("z-image-turbo", None),
-        ("z-image-turbo-controlnet", None),
-        ("z-image-turbo-controlnet-2.0", None),
-        ("z-image-turbo-controlnet-2.1", None),
-    ]
+UNSUPPORTED_SINGLE_FILE_MODEL_TYPES = (
+    "autoencoder-dc-f128c512",
+    "autoencoder-dc-f32c32",
+    "autoencoder-dc-f32c32-sana",
+    "autoencoder-dc-f64c128",
+    "cosmos-1.0-t2w-7B",
+    "cosmos-1.0-t2w-14B",
+    "cosmos-1.0-v2w-7B",
+    "cosmos-1.0-v2w-14B",
+    "cosmos-2.0-t2i-2B",
+    "cosmos-2.0-t2i-14B",
+    "cosmos-2.0-v2w-2B",
+    "cosmos-2.0-v2w-14B",
+    "hidream",
+    "hunyuan-video",
+    "instruct-pix2pix",
+    "ltx-video",
+    "ltx-video-0.9.1",
+    "ltx-video-0.9.5",
+    "ltx-video-0.9.7",
+    "mochi-1-preview",
+    "stable_cascade_stage_b",
+    "stable_cascade_stage_b_lite",
+    "stable_cascade_stage_c",
+    "stable_cascade_stage_c_lite",
+    "z-image-turbo",
+    "z-image-turbo-controlnet",
+    "z-image-turbo-controlnet-2.0",
+    "z-image-turbo-controlnet-2.1",
+)
+
+
+def _build_single_file_pipeline_mapping(auto_mapping, overrides):
+    mapping = OrderedDict()
+    for model_type, auto_key in SINGLE_FILE_MODEL_TYPE_TO_AUTO_PIPELINE_KEY.items():
+        mapping[model_type] = auto_mapping.get(auto_key)
+
+    for model_type in UNSUPPORTED_SINGLE_FILE_MODEL_TYPES:
+        mapping[model_type] = None
+
+    mapping.update(overrides)
+    return mapping
+
+
+_ANIMATEDIFF_OVERRIDES = {
+    "animatediff_rgb": AnimateDiffPipeline,
+    "animatediff_scribble": AnimateDiffPipeline,
+    "animatediff_sdxl_beta": AnimateDiffSDXLPipeline,
+    "animatediff_v1": AnimateDiffPipeline,
+    "animatediff_v2": AnimateDiffPipeline,
+    "animatediff_v3": AnimateDiffPipeline,
+}
+
+_ANIMATEDIFF_INPAINT_OVERRIDES = {}
+for model_type in _ANIMATEDIFF_OVERRIDES:
+    _ANIMATEDIFF_INPAINT_OVERRIDES[model_type] = None
+
+SINGLE_FILE_CHECKPOINT_TEXT2IMAGE_PIPELINE_MAPPING = _build_single_file_pipeline_mapping(
+    AUTO_TEXT2IMAGE_PIPELINES_MAPPING,
+    {
+        **_ANIMATEDIFF_OVERRIDES,
+        "flux-2-dev": FluxPipeline,
+        "inpainting": None,
+        "inpainting_v2": None,
+        "ovis": OvisImagePipeline,
+        "upscale": StableDiffusionUpscalePipeline,
+        "wan-i2v-14B": WanImageToVideoPipeline,
+        "wan-t2v-1.3B": WanPipeline,
+        "wan-t2v-14B": WanPipeline,
+        "wan-vace-1.3B": WanVideoToVideoPipeline,
+        "wan-vace-14B": WanVideoToVideoPipeline,
+        "xl_inpaint": None,
+        "z-image-omni": ZImageOmniPipeline,
+    },
+)
+
+SINGLE_FILE_CHECKPOINT_IMAGE2IMAGE_PIPELINE_MAPPING = _build_single_file_pipeline_mapping(
+    AUTO_IMAGE2IMAGE_PIPELINES_MAPPING,
+    {
+        **_ANIMATEDIFF_OVERRIDES,
+        "flux-2-dev": FluxImg2ImgPipeline,
+        "inpainting": None,
+        "inpainting_v2": None,
+        "qwenimage-layered": QwenImageLayeredPipeline,
+        "upscale": StableDiffusionUpscalePipeline,
+        "wan-i2v-14B": WanImageToVideoPipeline,
+        "wan-t2v-1.3B": None,
+        "wan-t2v-14B": None,
+        "wan-vace-1.3B": WanVideoToVideoPipeline,
+        "wan-vace-14B": WanVideoToVideoPipeline,
+        "xl_inpaint": None,
+    },
+)
+
+SINGLE_FILE_CHECKPOINT_INPAINT_PIPELINE_MAPPING = _build_single_file_pipeline_mapping(
+    AUTO_INPAINT_PIPELINES_MAPPING,
+    {
+        **_ANIMATEDIFF_INPAINT_OVERRIDES,
+        "flux-2-dev": FluxInpaintPipeline,
+        "inpainting": StableDiffusionInpaintPipeline,
+        "inpainting_v2": StableDiffusionInpaintPipeline,
+        "upscale": StableDiffusionUpscalePipeline,
+        "wan-i2v-14B": None,
+        "wan-t2v-1.3B": None,
+        "wan-t2v-14B": None,
+        "wan-vace-1.3B": None,
+        "wan-vace-14B": None,
+        "xl_inpaint": StableDiffusionXLInpaintPipeline,
+        "z-image-controlnet-inpaint": ZImageControlNetInpaintPipeline,
+    },
 )
 
 CONFIG_FILE_LIST = [
@@ -525,17 +396,17 @@ TOKENIZER_SHAPE_MAP = {
 }
 
 
-def get_allowed_extensions(allow_unsafe_formats: bool = True) -> List[str]:
+def get_allowed_extensions(allow_unsafe_formats: bool = False) -> list[str]:
     r"""
     Get the list of allowed file extensions based on safety preferences.
     
     Parameters:
-        allow_unsafe_formats (`bool`, *optional*, defaults to `True`):
-            If True (default), allows all formats (.safetensors, .ckpt, .bin) for backward compatibility.
-            If False, only allows .safetensors format for maximum security.
+        allow_unsafe_formats (`bool`, *optional*, defaults to `False`):
+            If True, allows all formats (.safetensors, .ckpt, .bin).
+            If False (default), only allows .safetensors format.
     
     Returns:
-        `List[str]`: List of allowed file extensions.
+        `list[str]`: List of allowed file extensions.
     """
     if allow_unsafe_formats:
         return [".safetensors", ".ckpt", ".bin"]
@@ -547,6 +418,82 @@ def get_allowed_extensions(allow_unsafe_formats: bool = True) -> List[str]:
 EXTENSION = [".safetensors", ".ckpt", ".bin"]
 
 CACHE_HOME = os.path.expanduser("~/.cache")
+REQUEST_TIMEOUT = 30
+ALLOWED_DOWNLOAD_HOSTS = (
+    "civitai.com",
+    "civitai.green",
+    "huggingface.co",
+    "hf.co",
+)
+
+
+def _normalize_dtype_kwargs(kwargs):
+    kwargs = dict(kwargs)
+    if "dtype" in kwargs and "torch_dtype" in kwargs:
+        raise ValueError("Pass only one of `dtype` or `torch_dtype`, not both.")
+
+    if "dtype" in kwargs and Version(diffusers_version) < Version("0.39.0"):
+        kwargs["torch_dtype"] = kwargs.pop("dtype")
+    elif "torch_dtype" in kwargs and Version(diffusers_version) >= Version("0.39.0"):
+        kwargs["dtype"] = kwargs.pop("torch_dtype")
+    return kwargs
+
+
+def _pipeline_loading_kwargs(kwargs):
+    load_kwargs = dict(kwargs)
+    for key in (
+        "_max_retries",
+        "_pipeline_tag",
+        "allow_unsafe_formats",
+        "base_model",
+        "candidate_index",
+        "checkpoint_format",
+        "download",
+        "gated",
+        "include_params",
+        "model_type",
+        "pipeline_tag",
+        "request_timeout",
+        "resume",
+        "skip_error",
+        "sort",
+    ):
+        load_kwargs.pop(key, None)
+    return _normalize_dtype_kwargs(load_kwargs)
+
+
+def _validate_remote_url(url, allowed_hosts=ALLOWED_DOWNLOAD_HOSTS):
+    parsed = urlparse(str(url))
+    host = (parsed.hostname or "").lower()
+
+    is_allowed_host = any(
+        host == allowed_host or host.endswith(f".{allowed_host}")
+        for allowed_host in allowed_hosts
+    )
+
+    if parsed.scheme != "https" or not is_allowed_host:
+        raise ValueError("Only HTTPS URLs from Civitai or Hugging Face are supported.")
+
+
+def _safe_filename(file_name):
+    if not isinstance(file_name, str) or not file_name or "\x00" in file_name:
+        raise ValueError("The remote API returned an invalid filename.")
+    if file_name != os.path.basename(file_name) or "/" in file_name or "\\" in file_name:
+        raise ValueError("The remote API returned an unsafe filename.")
+    return file_name
+
+
+def _safe_cache_path(cache_dir, *parts):
+    cache_root = os.path.abspath(os.fspath(cache_dir))
+    path_parts = [os.fspath(part) for part in parts]
+    candidate = os.path.abspath(os.path.join(cache_root, *path_parts))
+    try:
+        contained = os.path.commonpath([cache_root, candidate]) == cache_root
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError("The requested cache path is outside the cache directory.")
+    return candidate
 
 
 @dataclass
@@ -603,7 +550,7 @@ class ExtraStatus:
             The words used to trigger the model
     """
 
-    trained_words: Union[List[str], None] = None
+    trained_words: Union[list[str], None] = None
 
 
 @dataclass
@@ -649,15 +596,15 @@ def load_pipeline_from_single_file(
         pipeline_mapping (`dict`):
             A mapping of model types to their corresponding pipeline classes. This is used to determine
             which pipeline class to instantiate based on the model type inferred from the checkpoint.
-        torch_dtype (`str` or `torch.dtype`, *optional*):
-            Override the default `torch.dtype` and load the model with another dtype.
+        dtype (`torch.dtype` or `dict`, *optional*):
+            Override the default dtype. `torch_dtype` remains accepted for compatibility.
         force_download (`bool`, *optional*, defaults to `False`):
             Whether or not to force the (re-)download of the model weights and configuration files, overriding the
             cached versions if they exist.
         cache_dir (`Union[str, os.PathLike]`, *optional*):
             Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
             is not used.
-        proxies (`Dict[str, str]`, *optional*):
+        proxies (`dict[str, str]`, *optional*):
             A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
             'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
         local_files_only (`bool`, *optional*, defaults to `False`):
@@ -692,8 +639,9 @@ def load_pipeline_from_single_file(
     # Infer the model type from the loaded checkpoint
     model_type = infer_diffusers_model_type(checkpoint)
 
-    # Get the corresponding pipeline class from the pipeline mapping
-    pipeline_class = pipeline_mapping[model_type]
+    # Get the corresponding pipeline class from the explicit overrides or the
+    # installed Diffusers AutoPipeline mapping.
+    pipeline_class = pipeline_mapping.get(model_type)
 
     # For tasks not supported by this pipeline
     if pipeline_class is None:
@@ -706,7 +654,9 @@ def load_pipeline_from_single_file(
 
     else:
         # Load the pipeline from the checkpoint
-        return pipeline_class.from_single_file(pretrained_model_or_path, **kwargs)
+        return pipeline_class.from_single_file(
+            pretrained_model_or_path, **_pipeline_loading_kwargs(kwargs)
+        )
 
 
 def get_keyword_types(keyword):
@@ -742,6 +692,11 @@ def get_keyword_types(keyword):
     # Check if the keyword is an HTTP or HTTPS URL
     status["extra_type"]["url"] = bool(re.search(r"^(https?)://", keyword))
 
+    is_supported_url = any(
+        keyword.startswith(prefix)
+        for prefix in VALID_URL_PREFIXES
+    )
+
     # Check if the keyword is a file
     if os.path.isfile(keyword):
         status["type"]["local"] = True
@@ -769,7 +724,7 @@ def get_keyword_types(keyword):
         status["loading_method"] = None
 
     # Check if the keyword starts with any valid URL prefixes
-    elif any(keyword.startswith(prefix) for prefix in VALID_URL_PREFIXES):
+    elif is_supported_url:
         repo_id, weights_name = _extract_repo_id_and_weights_name(keyword)
         if weights_name:
             status["type"]["hf_url"] = True
@@ -798,8 +753,8 @@ def get_keyword_types(keyword):
 def validate_url_with_head(
     url: str, 
     token: Optional[str] = None, 
-    headers: Optional[Dict] = None,
-    timeout: int = 2
+    headers: Optional[dict] = None,
+    timeout: int = 10,
 ) -> None:
     """
     Validates a URL is accessible by performing a HEAD request.
@@ -820,6 +775,8 @@ def validate_url_with_head(
     Raises:
         requests.HTTPError: If the URL returns any 4xx or 5xx status code.
     """
+    _validate_remote_url(url)
+
     if headers is None:
         headers = {}
     else:
@@ -828,11 +785,17 @@ def validate_url_with_head(
     
     # If token is provided and authorization not already in headers, add it
     # Check case-insensitively since HTTP headers are case-insensitive
-    if token and not any(k.lower() == "authorization" for k in headers):
+    has_authorization_header = any(
+        header_name.lower() == "authorization"
+        for header_name in headers
+    )
+
+    if token and not has_authorization_header:
         headers["Authorization"] = f"Bearer {token}"
     
     try:
         response = requests.head(url, headers=headers, allow_redirects=True, timeout=timeout)
+        _validate_remote_url(response.url)
         # Raise HTTPError for any 4xx/5xx status codes (including 401)
         response.raise_for_status()
     except requests.HTTPError:
@@ -871,6 +834,8 @@ def file_downloader(
     returns:
         None
     """
+
+    _validate_remote_url(url)
 
     # Get optional parameters from kwargs, with their default values
     resume = kwargs.pop("resume", False)
@@ -997,6 +962,7 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
     search_word_status = get_keyword_types(search_word)
 
     if search_word_status["type"]["hf_repo"]:
+        repo_id = search_word
         hf_repo_info = asdict(
             hf_api.model_info(repo_id=search_word, securityStatus=True)
         )
@@ -1017,6 +983,7 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
             model_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=weights_name,
+                revision=revision,
                 token=token,
                 force_download=force_download,
                 cache_dir=cache_dir,
@@ -1036,7 +1003,7 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
         # Get model data from HF API
         hf_models = hf_api.list_models(
             search=search_word,
-            direction=-1,
+            sort="downloads",
             limit=100,
             fetch_config=True,
             pipeline_tag=pipeline_tag,
@@ -1044,7 +1011,9 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
             gated=gated,
             token=token,
         )
-        model_dicts = [asdict(value) for value in list(hf_models)]
+        model_dicts = []
+        for model in hf_models:
+            model_dicts.append(asdict(model))
 
         # Collect all valid candidates first
         candidates = []
@@ -1060,12 +1029,18 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
                 continue
                 
             # Lists files with security issues.
-            hf_security_info = hf_repo_info["security_repo_status"]
-            exclusion = [issue["path"] for issue in hf_security_info["filesWithIssues"]]
+            hf_security_info = hf_repo_info.get("security_repo_status") or {}
+            if not hf_security_info.get("scansDone"):
+                logger.info(f"Skipping {repo_id} because its security scan is incomplete.")
+                continue
+            exclusion = []
+            for issue in hf_security_info.get("filesWithIssues", []):
+                if "path" in issue:
+                    exclusion.append(issue["path"])
 
             # Checks for multi-folder diffusers model or valid files (models with security issues are excluded).
             if hf_security_info["scansDone"]:
-                for info in repo_info["siblings"]:
+                for info in repo_info.get("siblings", []):
                     file_path = info["rfilename"]
                     if "model_index.json" == file_path and checkpoint_format in [
                         "diffusers",
@@ -1079,30 +1054,48 @@ def search_huggingface(search_word: str, **kwargs) -> Union[str, SearchResult, N
                         })
                         break
 
-                    elif (
-                        any(file_path.endswith(ext) for ext in allowed_extensions)
-                        and not any(config in file_path for config in CONFIG_FILE_LIST)
-                        and not any(exc in file_path for exc in exclusion)
-                        and os.path.basename(os.path.dirname(file_path)) not in DIFFUSERS_CONFIG_DIR
-                        # If caller requested checkpoint-only, exclude filenames that look like LoRA/Textual-Inversion
-                        and not (
-                            model_type == "checkpoint"
-                            and any(kw in file_path.lower() for kw in ["lora", "textual", "inversion"])
+                    has_allowed_extension = any(
+                        file_path.endswith(extension)
+                        for extension in allowed_extensions
+                    )
+                    is_config_file = any(
+                        config_name in file_path
+                        for config_name in CONFIG_FILE_LIST
+                    )
+                    has_security_issue = any(
+                        excluded_path in file_path
+                        for excluded_path in exclusion
+                    )
+
+                    parent_directory = os.path.basename(os.path.dirname(file_path))
+                    is_diffusers_component = parent_directory in DIFFUSERS_CONFIG_DIR
+
+                    is_checkpoint_auxiliary = False
+                    if model_type == "checkpoint":
+                        lower_file_path = file_path.lower()
+                        auxiliary_markers = ["lora", "textual", "inversion"]
+                        is_checkpoint_auxiliary = any(
+                            marker in lower_file_path
+                            for marker in auxiliary_markers
                         )
+
+                    if (
+                        has_allowed_extension
+                        and not is_config_file
+                        and not has_security_issue
+                        and not is_diffusers_component
+                        and not is_checkpoint_auxiliary
                     ):
                         file_list.append(file_path)
                 
                 # Add single file candidates
                 if file_list:
                     # Sort and find the safest model
-                    file_name = next(
-                        (
-                            model
-                            for model in sorted(file_list, reverse=True)
-                            if re.search(r"(?i)[-_](safe|sfw)", model)
-                        ),
-                        file_list[0],
-                    )
+                    file_name = file_list[0]
+                    for model_file in sorted(file_list, reverse=True):
+                        if re.search(r"(?i)[-_](safe|sfw)", model_file):
+                            file_name = model_file
+                            break
                     candidates.append({
                         "type": "single_file",
                         "repo_id": repo_id,
@@ -1268,6 +1261,7 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
     cache_dir = kwargs.pop("cache_dir", None)
     skip_error = kwargs.pop("skip_error", False)
     allow_unsafe_formats = kwargs.pop("allow_unsafe_formats", False)
+    request_timeout = kwargs.pop("request_timeout", REQUEST_TIMEOUT)
     
     # Get allowed extensions based on safety preference
     allowed_extensions = get_allowed_extensions(allow_unsafe_formats)
@@ -1286,6 +1280,7 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
 
     # Handle direct Civitai API download URLs
     if search_word.startswith("https://civitai.com/api/download/"):
+        _validate_remote_url(search_word, allowed_hosts=("civitai.com",))
         # Extract model version ID from URL
         match = re.search(r'/models/(\d+)', search_word)
         if match:
@@ -1299,7 +1294,8 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
                 # Get version info to extract model name and ID
                 response = requests.get(
                     f"https://civitai.com/api/v1/model-versions/{version_id}",
-                    headers=headers
+                    headers=headers,
+                    timeout=request_timeout,
                 )
                 response.raise_for_status()
                 version_data = response.json()
@@ -1308,26 +1304,55 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
                 repo_id = str(version_data.get("modelId", ""))
                 trainedWords = version_data.get("trainedWords", [])
                 
-                # Get primary file info
-                files = version_data.get("files", [])
-                if files:
-                    primary_file = files[0]
-                    file_name = primary_file.get("name", f"model_{version_id}.safetensors")
-                else:
-                    file_name = f"model_{version_id}.safetensors"
+                # Keep only files that passed both scans and use an allowed extension.
+                files = []
+                for file_info in version_data.get("files", []):
+                    pickle_scan_passed = (
+                        file_info.get("pickleScanResult") == "Success"
+                    )
+                    virus_scan_passed = (
+                        file_info.get("virusScanResult") == "Success"
+                    )
+
+                    file_name = str(file_info.get("name", ""))
+                    has_allowed_extension = any(
+                        file_name.endswith(extension)
+                        for extension in allowed_extensions
+                    )
+
+                    if (
+                        pickle_scan_passed
+                        and virus_scan_passed
+                        and has_allowed_extension
+                    ):
+                        files.append(file_info)
+
+                if not files:
+                    raise ValueError(
+                        "The Civitai model version has no file that passed its "
+                        "security scans."
+                    )
+
+                selected_file = files[0]
+                for file_info in files:
+                    if file_info.get("primary"):
+                        selected_file = file_info
+                        break
+
+                file_name = _safe_filename(selected_file["name"])
                     
             except Exception as e:
-                logger.info(f"Could not fetch model info from API: {e}. Using fallback values.")
-                repo_name = f"model_{version_id}"
-                repo_id = ""
-                file_name = f"model_{version_id}.safetensors"
-                trainedWords = []
+                if skip_error:
+                    return None
+                raise ValueError("Could not verify the Civitai model version metadata.") from e
             
             download_url = search_word
             
             if download:
                 # Download from the direct URL
-                local_path = os.path.join(civitai_cache_dir, file_name)
+                local_path = _safe_cache_path(
+                    civitai_cache_dir, str(repo_id), str(version_id), file_name
+                )
                 
                 try:
                     file_downloader(
@@ -1395,35 +1420,32 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
     try:
         # Make the request to the CivitAI API
         response = requests.get(
-            "https://civitai.com/api/v1/models", params=params, headers=headers
+            "https://civitai.com/api/v1/models",
+            params=params,
+            headers=headers,
+            timeout=request_timeout,
         )
         response.raise_for_status()
-    except requests.exceptions.HTTPError as err:
+    except requests.exceptions.RequestException as err:
         if skip_error:
             return None
         else:
-            raise requests.HTTPError(f"Could not get elements from the URL: {err}")
+            raise requests.RequestException("Could not query the Civitai API.") from err
     else:
         try:
             data = response.json()
-        except AttributeError:
+        except (TypeError, ValueError):
             if skip_error:
                 return None
             else:
                 raise ValueError("Invalid JSON response")
 
-    # Sort repositories by download count in descending order
-    # sorted_repos = sorted(
-    #    data["items"], key=lambda x: x["stats"]["downloadCount"], reverse=True
-    # )
-
-    # Since the Civitai API is broken, I will temporarily sort by name.
-    sorted_repos = sorted(data["items"], key=lambda x: x["name"], reverse=True)
+    repositories = data.get("items", [])
 
     # Collect all valid candidates instead of selecting one
     all_candidates = []
 
-    for selected_repo in sorted_repos:
+    for selected_repo in repositories:
         repo_name = selected_repo["name"]
         repo_id = selected_repo["id"]
 
@@ -1442,11 +1464,19 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
                 for model_data in selected_version["files"]:
                     # Check if the file passes security scans and has a valid extension
                     file_name = model_data["name"]
+
+                    has_allowed_extension = any(
+                        file_name.endswith(extension)
+                        for extension in allowed_extensions
+                    )
+
                     if (
-                        model_data["pickleScanResult"] == "Success"
-                        and model_data["virusScanResult"] == "Success"
-                        and any(file_name.endswith(ext) for ext in allowed_extensions)
+                        model_data.get("pickleScanResult") == "Success"
+                        and model_data.get("virusScanResult") == "Success"
+                        and has_allowed_extension
                     ):
+                        file_name = _safe_filename(file_name)
+                        _validate_remote_url(model_data["downloadUrl"])
                         file_status = {
                             "filename": file_name,
                             "download_url": model_data["downloadUrl"],
@@ -1459,16 +1489,14 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
                     models_list, key=lambda x: x["filename"], reverse=True
                 )
                 # Prefer safe/sfw models
-                candidate_model = next(
-                    (
-                        model_data
-                        for model_data in sorted_models
-                        if bool(
-                            re.search(r"(?i)[-_](safe|sfw)", model_data["filename"])
-                        )
-                    ),
-                    sorted_models[0],
-                )
+                candidate_model = sorted_models[0]
+                for model_data in sorted_models:
+                    is_safe_variant = re.search(
+                        r"(?i)[-_](safe|sfw)", model_data["filename"]
+                    )
+                    if is_safe_variant:
+                        candidate_model = model_data
+                        break
                 
                 # Add to candidates list (skip URL validation which causes 403 errors)
                 # Actual download will be attempted and retried recursively
@@ -1531,8 +1559,11 @@ def search_civitai(search_word: str, **kwargs) -> Union[str, SearchResult, None]
                 logger.info(f"Attempt {idx + 1}/{len(all_candidates)}: {file_name} from {candidate['repo_name']}")
                 
                 # The path where the model is to be saved
-                model_path = os.path.join(
-                    str(civitai_cache_dir), str(candidate_repo_id), str(candidate_version_id), str(file_name)
+                model_path = _safe_cache_path(
+                    civitai_cache_dir,
+                    str(candidate_repo_id),
+                    str(candidate_version_id),
+                    file_name,
                 )
                 
                 # Download Model File
@@ -1628,21 +1659,22 @@ def _load_pipeline_with_retries(cls, pretrained_model_link_or_path, pipeline_map
     max_retries = kwargs.pop('_max_retries', 9)
     failed_count = 0
     
-    # Update kwargs to ensure the model is downloaded and parameters are included
-    _status = {
+    search_kwargs = {
+        **kwargs,
         "download": True,
         "include_params": True,
         "skip_error": False,
-        "pipeline_tag": kwargs.pop('_pipeline_tag', None),
+        "pipeline_tag": kwargs.get("_pipeline_tag"),
     }
-    kwargs.update(_status)
     
     # Try each candidate up to max_retries times
     for attempt in range(max_retries + 1):
         # Search for the model on Hugging Face
         try:
             hf_checkpoint_status = search_huggingface(
-                pretrained_model_link_or_path, candidate_index=attempt, **kwargs
+                pretrained_model_link_or_path,
+                candidate_index=attempt,
+                **search_kwargs,
             )
         except Exception as e:
             logger.info(f"Candidate {attempt + 1}/{max_retries + 1} search failed: {e}")
@@ -1669,7 +1701,9 @@ def _load_pipeline_with_retries(cls, pretrained_model_link_or_path, pipeline_map
                     **kwargs,
                 )
             else:
-                pipeline = cls.from_pretrained(checkpoint_path, **kwargs)
+                pipeline = cls.from_pretrained(
+                    checkpoint_path, **_pipeline_loading_kwargs(kwargs)
+                )
             
             logger.info(
                 f"checkpoint_path: {hf_checkpoint_status.model_status.download_url}"  # type: ignore
@@ -1709,16 +1743,16 @@ def add_methods(pipeline):
     for attr_name in dir(AutoConfig):
         attr_value = getattr(AutoConfig, attr_name)
         if callable(attr_value) and not attr_name.startswith("__"):
-            setattr(pipeline, attr_name, types.MethodType(attr_value, pipeline))
+            setattr(pipeline, attr_name, MethodType(attr_value, pipeline))
     return pipeline
 
 
 class AutoConfig:
     def auto_load_textual_inversion(
         self,
-        pretrained_model_name_or_path: Union[str, List[str]],
-        token: Optional[Union[str, List[str]]] = None,
-        base_model: Optional[Union[str, List[str]]] = None,
+        pretrained_model_name_or_path: Union[str, list[str]],
+        token: Optional[Union[str, list[str]]] = None,
+        base_model: Optional[Union[str, list[str]]] = None,
         tokenizer=None,
         text_encoder=None,
         **kwargs,
@@ -1728,7 +1762,7 @@ class AutoConfig:
         Automatic1111 formats are supported).
 
         Parameters:
-            pretrained_model_name_or_path (`str` or `os.PathLike` or `List[str or os.PathLike]` or `Dict` or `List[Dict]`):
+            pretrained_model_name_or_path (`str`, `os.PathLike`, `list`, or `dict`):
                 Can be either one of the following or a list of them:
 
                     - Search keywords for pretrained model (for example `EasyNegative`).
@@ -1740,7 +1774,7 @@ class AutoConfig:
                     - A [torch state
                       dict](https://pytorch.org/tutorials/beginner/saving_loading_models.html#what-is-a-state-dict).
 
-            token (`str` or `List[str]`, *optional*):
+            token (`str` or `list[str]`, *optional*):
                 Override the token to use for the textual inversion weights. If `pretrained_model_name_or_path` is a
                 list, then `token` must also be a list of equal length.
             text_encoder ([`~transformers.CLIPTextModel`], *optional*):
@@ -1761,7 +1795,7 @@ class AutoConfig:
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             local_files_only (`bool`, *optional*, defaults to `False`):
@@ -1867,9 +1901,9 @@ class AutoConfig:
 
     def auto_load_lora_weights(
         self,
-        pretrained_model_name_or_path_or_dict: Union[str, Dict[str, torch.Tensor]],
+        pretrained_model_name_or_path_or_dict: Union[str, dict[str, torch.Tensor]],
         adapter_name=None,
-        base_model: Optional[Union[str, List[str]]] = None,
+        base_model: Optional[Union[str, list[str]]] = None,
         **kwargs,
     ):
         r"""
@@ -1893,7 +1927,7 @@ class AutoConfig:
             adapter_name (`str`, *optional*):
                 Adapter name to be used for referencing the loaded adapter model. If not specified, it will use
                 `default_{i}` where i is the total number of adapters being loaded.
-            base_model (`str` or `List[str]`, *optional*):
+            base_model (`str` or `list[str]`, *optional*):
                 Base model tag(s) to filter LoRA models (e.g., "SD 1.5", "SDXL 1.0"). Used when searching Civitai
                 to ensure LoRA compatibility with the current pipeline's base model.
             low_cpu_mem_usage (`bool`, *optional*):
@@ -1929,9 +1963,20 @@ class AutoConfig:
                 logger.warning(f"lora_path: {lora_path}")
                 pretrained_model_name_or_path_or_dict = lora_path
 
-        self.load_lora_weights(
-            pretrained_model_name_or_path_or_dict, adapter_name=adapter_name, **kwargs
-        )
+        try:
+            self.load_lora_weights(
+                pretrained_model_name_or_path_or_dict,
+                adapter_name=adapter_name,
+                **kwargs,
+            )
+        except ImportError as error:
+            if "incompatible version of torchao" in str(error):
+                raise ImportError(
+                    "The installed torchao version is incompatible with PEFT. "
+                    "If torchao quantization is not needed, uninstall torchao and restart the runtime. "
+                    "Otherwise install mutually compatible PyTorch, PEFT, and torchao versions."
+                ) from error
+            raise
 
 
 class EasyPipelineForText2Image(AutoPipelineForText2Image):
@@ -1975,9 +2020,8 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 The format of the model checkpoint.
             pipeline_tag (`str`, *optional*):
                 Tag to filter models by pipeline.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -1985,7 +2029,7 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -2007,7 +2051,7 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2015,7 +2059,7 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
@@ -2101,9 +2145,8 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 Path to the folder where cached files are stored.
             resume (`bool`, *optional*, defaults to `False`):
                 Whether to resume an incomplete download.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -2114,7 +2157,7 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 won't be downloaded from the Hub.
             token (`str`, *optional*):
                 The token to use as HTTP bearer authorization for remote files.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2122,7 +2165,7 @@ class EasyPipelineForText2Image(AutoPipelineForText2Image):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
@@ -2226,9 +2269,8 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 The format of the model checkpoint.
             pipeline_tag (`str`, *optional*):
                 Tag to filter models by pipeline.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -2236,7 +2278,7 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -2258,7 +2300,7 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2266,7 +2308,7 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
@@ -2343,9 +2385,8 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 Path to the folder where cached files are stored.
             resume (`bool`, *optional*, defaults to `False`):
                 Whether to resume an incomplete download.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -2356,7 +2397,7 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 won't be downloaded from the Hub.
             token (`str`, *optional*):
                 The token to use as HTTP bearer authorization for remote files.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2364,7 +2405,7 @@ class EasyPipelineForImage2Image(AutoPipelineForImage2Image):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
@@ -2468,9 +2509,8 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 The format of the model checkpoint.
             pipeline_tag (`str`, *optional*):
                 Tag to filter models by pipeline.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -2478,7 +2518,7 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -2500,7 +2540,7 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2508,7 +2548,7 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
@@ -2585,9 +2625,8 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 Path to the folder where cached files are stored.
             resume (`bool`, *optional*, defaults to `False`):
                 Whether to resume an incomplete download.
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            dtype (`torch.dtype` or `dict`, *optional*):
+                Override the default dtype. `torch_dtype` remains accepted for compatibility.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
@@ -2598,7 +2637,7 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 won't be downloaded from the Hub.
             token (`str`, *optional*):
                 The token to use as HTTP bearer authorization for remote files.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, Union[int, str, torch.device]]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -2606,7 +2645,7 @@ class EasyPipelineForInpainting(AutoPipelineForInpainting):
                 Set `device_map="auto"` to have 🤗 Accelerate automatically compute the most optimized `device_map`. For
                 more information about each option see [designing a device
                 map](https://hf.co/docs/accelerate/main/en/usage_guides/big_modeling#designing-a-device-map).
-            max_memory (`Dict`, *optional*):
+            max_memory (`dict`, *optional*):
                 A dictionary device identifier for the maximum memory. Will default to the maximum memory available for
                 each GPU and the available CPU RAM if unset.
             offload_folder (`str` or `os.PathLike`, *optional*):
